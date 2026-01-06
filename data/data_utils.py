@@ -1,133 +1,95 @@
 # =========================================================
-# DATA UTILS: Load, Clean, Feature Engineering & Scaling
+# DATA UTILS: Load, Feature Engineering & Scaling
+# (Prediction setup: GHI → Power)
 # =========================================================
-import pandas as pd, numpy as np
+
+import pandas as pd
+import numpy as np
 from sklearn.preprocessing import RobustScaler
 from joblib import dump
 import os
 
-# ---------- 1️⃣ Load CSV ----------
+# =========================================================
+# 1️⃣ Load CSV
+# =========================================================
 def load_power(csv_path):
     df = pd.read_csv(csv_path)
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    time_col = next((c for c in df.columns if "timestamp" in c or "time" in c), df.columns[0])
-    ghi_col = next((c for c in df.columns if "ghi" in c.lower()), None)
-    power_col = next((c for c in df.columns if "actual" in c.lower() or "power" in c.lower()), None)
-    zenith_col = next((c for c in df.columns if c.lower() == "zenith"), None)
-    cos_col = next((c for c in df.columns if c.lower() == "cos_zenith"), None)
+    time_col = next((c for c in df.columns if "timestamp" in c or c == "time"), None)
+    if time_col is None:
+        raise ValueError(f"❌ Timestamp column missing in {csv_path}")
 
-    # EXACT temperature column t2m
-    temp_col = "t2m" if "t2m" in df.columns else None
+    df = df.rename(columns={time_col: "Timestamp"})
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"])
 
-    if not all([time_col, ghi_col, power_col, zenith_col, cos_col]):
-        raise ValueError(f"❌ Missing key columns in {csv_path}")
-
-    rename_dict = {
-        time_col: "Timestamp",
-        ghi_col: "ghi",
-        power_col: "Actual",
-        zenith_col: "zenith",
-        cos_col: "cos_zenith"
-    }
-
-    df.rename(columns=rename_dict, inplace=True)
     return df
 
 
-
-
-# ---------- Feature Engineering ----------
-def add_features(df, mode="train", rng=None):
+# =========================================================
+# 2️⃣ Feature Engineering
+# =========================================================
+def add_features(df, mode="train"):
     """
-    mode: "train" or "infer"
-    rng : np.random.Generator (optional, for reproducibility)
+    mode:
+      - 'train' / 'eval' → compute cf (needs actual)
+      - 'infer'          → NO cf, NO actual dependency
     """
+
+    assert mode in {"train", "eval", "infer"}
 
     df = df.copy()
 
-    if rng is None:
-        rng = np.random.default_rng()
+    # ---------- Required physics ----------
+    if "clear_sky_ghi" not in df.columns:
+        raise ValueError("❌ clear_sky_ghi missing (must be precomputed)")
 
-    # =====================================================
-    # GHI AUGMENTATION (TRAINING ONLY)
-    # =====================================================
-    if mode == "train":
-        # --- noise level mimics different revisions ---
-        sigma = rng.choice([0.05, 0.10, 0.15])  # late → early revisions
+    if "ghi" not in df.columns:
+        raise ValueError("❌ ghi missing")
 
-        noise = rng.normal(0.0, sigma, size=len(df))
+    if "available_capacity" not in df.columns:
+        raise ValueError("❌ available_capacity missing")
 
-        # --- multiplicative bias ---
-        bias = rng.uniform(0.9, 1.1)
+    # ---------- Physics-derived ----------
+    df["csi"] = df["ghi"] / (df["clear_sky_ghi"] + 1e-6)
+    df["csi"] = df["csi"].clip(0.0, 1.5)
 
-        ghi_aug = df["ghi"] * (1.0 + noise) * bias
+    df["ghi_sq"] = df["ghi"] ** 2
+    df["ghi_cu"] = df["ghi"] ** 3
 
-        # physical constraints
-        ghi_aug = ghi_aug.clip(lower=0.0)
-
-        df["ghi_aug"] = ghi_aug
-
-    else:
-        # inference: NO augmentation
-        df["ghi_aug"] = df["ghi"]
-
-    # =====================================================
-    # GHI DERIVED FEATURES (FROM ghi_aug)
-    # =====================================================
-    df["log_GHI"]   = np.log1p(df["ghi_aug"])
-    df["GHI_sq"]    = df["ghi_aug"] ** 2
-    df["GHI_cubed"] = df["ghi_aug"] ** 3
-    df["GHI_cosZ"]  = df["ghi_aug"] * df["cos_zenith"]
-
-    # =====================================================
-    # TIME FEATURES
-    # =====================================================
-    ts = pd.to_datetime(df["Timestamp"])
-    df["hour"] = ts.dt.hour + ts.dt.minute / 60
-    df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-
-    # =====================================================
-    # TEMPERATURE (RAW)
-    # =====================================================
+    # ---------- Temperature (teacher only) ----------
     if "t2m" in df.columns:
         df["t2m"] = df["t2m"].astype(float)
+
+    # ---------- Target (ONLY for train / eval) ----------
+    if mode in {"train", "eval"}:
+        if "actual" not in df.columns:
+            raise ValueError("❌ actual missing for training/eval")
+
+        df["cf"] = df["actual"] / (df["available_capacity"] + 1e-6)
+        df["cf"] = df["cf"].clip(0.0, 1.2)
 
     return df
 
 
-# ---------- 4️⃣ Feature Scaling ----------
-def scale_features(df_train, df_val, df_test, feature_cols, save_dir):
+# =========================================================
+# 3️⃣ Feature Scaling
+# =========================================================
+def scale_features(mode, df_train, df_val, df_test, feature_cols, save_dir):
+    """
+    mode: 'teacher' or 'student'
+    """
+
     scaler = RobustScaler()
+
     x_train = scaler.fit_transform(df_train[feature_cols])
     x_val   = scaler.transform(df_val[feature_cols])
     x_test  = scaler.transform(df_test[feature_cols])
 
-    dump({"scaler_x": scaler}, os.path.join(save_dir, "scaler_x.pkl"))
-    return x_train, x_val, x_test
-
-
-# ---------- 5️⃣ Preprocess Data: Bias Normalization + Target ----------
-def preprocess_data(df_train, df_val, df_test, save_dir):
-
-    # Power + GHI normalization constants
-    P_mean, P_std = df_train["Actual"].mean(), df_train["Actual"].std()
-    GHI_mean, GHI_std = df_train["ghi"].mean(), df_train["ghi"].std()
-
-    for df in [df_train, df_val, df_test]:
-        df["ghi_norm"] = (df["ghi"] - GHI_mean) / (GHI_std + 1e-6)
-        df["power_norm"] = (df["Actual"] - P_mean) / (P_std + 1e-6)
-
-        df["y_rel"] = (df["power_norm"] / (df["ghi_norm"] + 1e-6)) - 1
-        df["y_rel"] = df["y_rel"].clip(-0.5, 1.0)
-
-    # Save constants
-    np.save(
-        os.path.join(save_dir, "power_ghi_mean_std.npy"),
-        np.array([P_mean, P_std, GHI_mean, GHI_std])
+    os.makedirs(save_dir, exist_ok=True)
+    dump(
+        scaler,
+        os.path.join(save_dir, f"scaler_x_{mode}.pkl")
     )
 
-    print("📦 Saved normalization constants.")
-
-    return df_train, df_val, df_test
+    return x_train, x_val, x_test

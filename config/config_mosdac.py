@@ -6,7 +6,7 @@ import os
 import torch
 
 # === Site Information ===
-SITE_NAME = "Fermi_Solar_132kV"
+SITE_NAME = "Chandrapur_33kV"
 
 # === Directory Paths ===
 BASE_DIR = "/mnt/DATA1/pankhi/forecast/solar_pipe/DATA"
@@ -23,27 +23,20 @@ VAL_PATH   = f"{SPLIT_DIR}/val/{SITE_NAME}.csv"
 TEST_PATH = f"{SPLIT_DIR}/test/{SITE_NAME}.csv"
 
 # === Feature List ===
-FEATURE_COLS = [
-    # --- Irradiance & geometry ---
+TEACHER_FEATURES = [
+    "csi",
     "ghi",
-    "zenith",
     "cos_zenith",
-
-    # --- GHI nonlinear features ---
-    "log_GHI",
-    "GHI_sq",
-    "GHI_cubed",
-    "GHI_cosZ",
-
-    # --- Time encoding ---
-    "hour_sin",
-    "hour_cos",
-
-    # --- Physical baseline ---
-    # "climatology_power",
-
-    # --- Meteorology ---
-    # "t2m"
+    "ghi_sq",
+    "ghi_cu",
+    "t2m"
+]
+STUDENT_FEATURES = [
+    "csi",
+    "ghi",
+    "cos_zenith",
+    "ghi_sq",
+    "ghi_cu"
 ]
 
 

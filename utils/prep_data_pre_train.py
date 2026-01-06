@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from pvlib import solarposition
+from pvlib import solarposition, location
 
 # =========================================================
 # PATHS
@@ -23,9 +23,7 @@ TZ = "Asia/Kolkata"
 sites_df = pd.read_csv(SITE_CSV)
 sites_df.columns = [c.strip().lower() for c in sites_df.columns]
 
-assert {
-    "pos_name", "state", "latitude", "longitude"
-}.issubset(sites_df.columns)
+assert {"pos_name", "state", "latitude", "longitude"}.issubset(sites_df.columns)
 
 # =========================================================
 # HELPERS
@@ -82,21 +80,12 @@ for _, row in sites_df.iterrows():
     # ---------------- GHI: UTC → IST ----------------
     ghi_ts_col = "time" if "time" in ghi.columns else "timestamp"
 
-    ghi["timestamp"] = pd.to_datetime(
-        ghi[ghi_ts_col],
-        utc=True,
-        errors="coerce"
-    )
+    ghi["timestamp"] = pd.to_datetime(ghi[ghi_ts_col], utc=True, errors="coerce")
+    ghi["timestamp"] = ghi["timestamp"].dt.tz_convert(TZ).dt.tz_localize(None)
 
-    ghi["timestamp"] = (
-        ghi["timestamp"]
-        .dt.tz_convert(TZ)
-        .dt.tz_localize(None)
-    )
-
-    # ---------------- POWER & ERA5 (already IST) ----------------
+    # ---------------- POWER & ERA5 ----------------
     power["timestamp"] = pd.to_datetime(power["timestamp"])
-    era5["time"]       = pd.to_datetime(era5["time"])
+    era5["timestamp"]  = pd.to_datetime(era5["time"])
 
     # ---------------- AVAILABLE CAPACITY ----------------
     cap_col = next(
@@ -110,8 +99,8 @@ for _, row in sites_df.iterrows():
     power = power.rename(columns={cap_col: "available_capacity"})
 
     # ---------------- COMMON PERIOD ----------------
-    start = max(ghi["timestamp"].min(), power["timestamp"].min(), era5["time"].min())
-    end   = min(ghi["timestamp"].max(), power["timestamp"].max(), era5["time"].max())
+    start = max(ghi["timestamp"].min(), power["timestamp"].min(), era5["timestamp"].min())
+    end   = min(ghi["timestamp"].max(), power["timestamp"].max(), era5["timestamp"].max())
 
     if start >= end:
         print("  ❌ No overlapping time range")
@@ -122,7 +111,7 @@ for _, row in sites_df.iterrows():
 
     ghi   = ghi.set_index("timestamp").reindex(full_time)
     power = power.set_index("timestamp").reindex(full_time)
-    era5  = era5.set_index("time").reindex(full_time).interpolate("time")
+    era5  = era5.set_index("timestamp").reindex(full_time).interpolate("time")
 
     power["available_capacity"] = power["available_capacity"].ffill()
 
@@ -140,15 +129,12 @@ for _, row in sites_df.iterrows():
         continue
 
     # =====================================================
-    # TIME FEATURES
-    # =====================================================
-    final["hour"]  = final["timestamp"].dt.hour + final["timestamp"].dt.minute / 60
-    final["month"] = final["timestamp"].dt.month
-
-    # =====================================================
     # SOLAR GEOMETRY
     # =====================================================
-    ts_local = final["timestamp"].dt.tz_localize(TZ, nonexistent="shift_forward")
+    ts_local = pd.DatetimeIndex(
+    final["timestamp"]
+).tz_localize(TZ, nonexistent="shift_forward")
+
 
     solpos = solarposition.get_solarposition(
         time=ts_local,
@@ -160,14 +146,35 @@ for _, row in sites_df.iterrows():
     final["cos_zenith"] = np.cos(np.radians(final["zenith"]))
 
     # =====================================================
-    # CAPACITY FACTOR
+    # CLEAR-SKY GHI (PHYSICS ANCHOR)
+    # =====================================================
+    loc = location.Location(lat, lon, tz=TZ)
+    clearsky = loc.get_clearsky(ts_local, model="ineichen")
+
+    final["clear_sky_ghi"] = clearsky["ghi"].values
+    final["clear_sky_ghi"] = final["clear_sky_ghi"].clip(lower=1.0)
+
+    # =====================================================
+    # DERIVED FEATURES (MODEL INPUTS)
+    # =====================================================
+    final["csi"] = final["ghi"] / final["clear_sky_ghi"]
+    final["csi"] = final["csi"].clip(0, 1.5)
+
+    final["ghi_sq"] = final["ghi"] ** 2
+    final["ghi_cu"] = final["ghi"] ** 3
+
+    # =====================================================
+    # TARGET: NORMALIZED POWER
     # =====================================================
     final["cf"] = final["actual"] / final["available_capacity"]
     final["cf"] = final["cf"].clip(0, 1.2)
 
     # =====================================================
-    # CLIMATOLOGY (MONTH × HOUR)
+    # CLIMATOLOGY (OPTIONAL BASELINE)
     # =====================================================
+    final["hour"]  = final["timestamp"].dt.hour + final["timestamp"].dt.minute / 60
+    final["month"] = final["timestamp"].dt.month
+
     clim_src = final[
         (final["ghi"] > 20) &
         (final["cos_zenith"] > 0.05)
@@ -183,9 +190,7 @@ for _, row in sites_df.iterrows():
 
     final = final.merge(clim, on=["month", "hour"], how="left")
     final["climatology_cf"] = final["climatology_cf"].fillna(0.0)
-    final["climatology_power"] = (
-        final["climatology_cf"] * final["available_capacity"]
-    )
+    final["climatology_power"] = final["climatology_cf"] * final["available_capacity"]
 
     # =====================================================
     # SAVE

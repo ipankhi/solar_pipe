@@ -1,5 +1,5 @@
 # =========================================================
-# TRAIN FUNCTION: Physics-Guided EnhancedPowerNet_v4
+# TRAIN FUNCTION: PowerNet with Teacher–Student Distillation
 # =========================================================
 import os
 import torch
@@ -7,14 +7,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from config.config_mosdac import *
-from data.data_utils import (
-    load_power,
-    add_features,
-    preprocess_data,
-    scale_features
-)
+from data.data_utils import load_power, add_features, scale_features
 from models.power_net import PowerNet
-from models.loss_functions import AsymSmoothL1_Physics
+from models.loss_functions import DistillSmoothL1
 
 
 def train_powernet(
@@ -22,100 +17,120 @@ def train_powernet(
     save_dir: str = SAVE_DIR,
     train_path: str = TRAIN_PATH,
     val_path: str = VAL_PATH,
-    test_path: str = TEST_PATH,
-    feature_cols: list = FEATURE_COLS,
+    feature_cols_student: list = STUDENT_FEATURES,
+    feature_cols_teacher: list | None = None,
     hyperparams: dict = HYPERPARAMS,
+    mode: str = "student"   # "teacher" | "student"
 ):
     """
-    Train the Physics-Guided PowerNet
-    - GHI augmentation ONLY during training
-    - Climatology-based baseline
-    - Multi-GPU via DataParallel
+    PowerNet training
+    - Teacher: uses temperature (T2M)
+    - Student: distilled from teacher
     """
 
-    # =====================================================
-    # 0. SETUP
-    # =====================================================
+    assert mode in {"teacher", "student"}
     os.makedirs(save_dir, exist_ok=True)
-    print(f"🚀 Training PowerNet for {site_name}")
-    print(f"🖥️  Device: {DEVICE}")
 
-    rng = np.random.default_rng(seed=42)
+    device = torch.device(DEVICE)
+    print(f"\n🚀 Training PowerNet ({mode.upper()}) for {site_name}")
+    print(f"🖥️  Device: {device}")
 
     # =====================================================
     # 1. LOAD DATA
     # =====================================================
-    print("📥 Loading data ...")
-    df_train, df_val, df_test = map(load_power, [train_path, val_path, test_path])
+    df_train = load_power(train_path)
+    df_val   = load_power(val_path)
+
+    df_train = add_features(df_train)
+    df_val   = add_features(df_val)
 
     # =====================================================
-    # 2. FEATURE ENGINEERING
+    # 2. FEATURE SELECTION
     # =====================================================
-    print("⚙️ Adding engineered features ...")
-    df_train = add_features(df_train, mode="train", rng=rng)
-    df_val   = add_features(df_val,   mode="infer")
-    df_test  = add_features(df_test,  mode="infer")
+    if mode == "teacher":
+        assert feature_cols_teacher is not None
+        feature_cols = feature_cols_teacher
+    else:
+        feature_cols = feature_cols_student
 
     # =====================================================
-    # 3. TARGET PREPROCESSING
+    # 3. CLEAN DATA
     # =====================================================
-    print("📊 Computing targets ...")
-    df_train, df_val, df_test = preprocess_data(
-        df_train, df_val, df_test, save_dir
+    cols_needed = feature_cols + ["cf"]
+    df_train = df_train.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_needed)
+    df_val   = df_val.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_needed)
+
+    assert len(df_train) > 100, "❌ Train set too small"
+    assert len(df_val) > 100, "❌ Val set too small"
+
+    # =====================================================
+    # 4. TARGET
+    # =====================================================
+    y_train = torch.tensor(df_train["cf"].values, dtype=torch.float32).view(-1, 1).to(device)
+    y_val   = torch.tensor(df_val["cf"].values,   dtype=torch.float32).view(-1, 1).to(device)
+
+    # =====================================================
+    # 5. FEATURE SCALING
+    # =====================================================
+    x_train, x_val, _ = scale_features(mode,
+        df_train, df_val, df_val, feature_cols, save_dir
     )
 
-    # =====================================================
-    # 4. FEATURE SCALING
-    # =====================================================
-    print("📏 Scaling features ...")
-    x_train, x_val, _ = scale_features(
-        df_train, df_val, df_test, feature_cols, save_dir
-    )
-
-    y_train = df_train["y_rel"].values.reshape(-1, 1)
-    y_val   = df_val["y_rel"].values.reshape(-1, 1)
+    x_train_t = torch.tensor(x_train, dtype=torch.float32).to(device)
+    x_val_t   = torch.tensor(x_val,   dtype=torch.float32).to(device)
 
     # =====================================================
-    # 5. TORCH TENSORS
+    # 6. MODEL
     # =====================================================
-    x_train_t = torch.tensor(x_train, dtype=torch.float32).to(DEVICE)
-    x_val_t   = torch.tensor(x_val,   dtype=torch.float32).to(DEVICE)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32).to(DEVICE)
-    y_val_t   = torch.tensor(y_val,   dtype=torch.float32).to(DEVICE)
-
-    # Physics loss MUST use true GHI
-    ghi_train = torch.tensor(df_train["ghi"].values, dtype=torch.float32).to(DEVICE)
-    ghi_val   = torch.tensor(df_val["ghi"].values,   dtype=torch.float32).to(DEVICE)
-
-    # =====================================================
-    # 6. MODEL + MULTI-GPU
-    # =====================================================
-    print("🧠 Initializing model ...")
-
-    model = PowerNet(
+    student = PowerNet(
         input_dim=len(feature_cols),
         hidden=hyperparams["hidden"],
         drop=hyperparams["dropout"]
+    ).to(device)
+
+    print(f"🧮 Student params: {sum(p.numel() for p in student.parameters()):,}")
+
+    # =====================================================
+    # 7. LOAD TEACHER (STUDENT MODE ONLY)
+    # =====================================================
+    teacher = None
+    if mode == "student":
+        assert feature_cols_teacher is not None
+
+        teacher = PowerNet(
+            input_dim=len(feature_cols_teacher),
+            hidden=hyperparams["hidden"],
+            drop=hyperparams["dropout"]
+        ).to(device)
+
+        teacher_ckpt = os.path.join(save_dir, "best_teacher_powernet.pt")
+        teacher.load_state_dict(torch.load(teacher_ckpt, map_location=device))
+        teacher.eval()
+
+        for p in teacher.parameters():
+            p.requires_grad = False
+
+        # Teacher inputs
+        x_train_teacher, x_val_teacher, _ = scale_features(
+            mode=="teacher",df_train, df_val, df_val, feature_cols_teacher, save_dir
+        )
+
+        x_train_teacher_t = torch.tensor(x_train_teacher, dtype=torch.float32).to(device)
+        x_val_teacher_t   = torch.tensor(x_val_teacher,   dtype=torch.float32).to(device)
+
+        print("🎓 Teacher loaded and frozen")
+
+    # =====================================================
+    # 8. LOSS & OPTIMIZER
+    # =====================================================
+    criterion = DistillSmoothL1(
+        alpha=1.0 if mode == "teacher" else hyperparams.get("alpha", 0.6),
+        beta=0.1
     )
 
-    if torch.cuda.device_count() > 1:
-        print(f"🚀 Using {torch.cuda.device_count()} GPUs")
-        model = torch.nn.DataParallel(model)
-
-    model = model.to(DEVICE)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    print(f"🧮 Parameters:")
-    print(f"   • Total     : {total_params:,}")
-    print(f"   • Trainable : {trainable_params:,}")
-
-    criterion = AsymSmoothL1_Physics()
-
     optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=hyperparams["lr"],
+        student.parameters(),
+        lr=hyperparams.get("lr", 3e-4),
         weight_decay=hyperparams["weight_decay"]
     )
 
@@ -126,51 +141,54 @@ def train_powernet(
     )
 
     # =====================================================
-    # 7. TRAINING LOOP
+    # 9. TRAINING LOOP
     # =====================================================
-    print(f"📈 Training for {hyperparams['epochs']} epochs ...")
-
     best_val = float("inf")
     wait = 0
     train_losses, val_losses = [], []
 
     for epoch in range(hyperparams["epochs"]):
 
-        # ---------------- TRAIN ----------------
-        model.train()
+        # ---------- TRAIN ----------
+        student.train()
         optimizer.zero_grad()
 
-        pred_train = model(x_train_t)
-        loss_train = criterion(pred_train, y_train_t, ghi_train)
+        pred_s = torch.clamp(student(x_train_t), -0.2, 1.5)
+
+        if mode == "student":
+            with torch.no_grad():
+                pred_t = torch.clamp(teacher(x_train_teacher_t), -0.2, 1.5)
+
+            loss_train = criterion(pred_student=pred_s, target=y_train, pred_teacher=pred_t)
+        else:
+            loss_train = criterion(pred_student=pred_s, target=y_train)
 
         loss_train.backward()
+        torch.nn.utils.clip_grad_norm_(student.parameters(), 5.0)
         optimizer.step()
 
-        # ---------------- VALIDATION ----------------
-        model.eval()
+        # ---------- VALIDATION ----------
+        student.eval()
         with torch.no_grad():
-            pred_val = model(x_val_t)
-            loss_val = criterion(pred_val, y_val_t, ghi_val)
+            pred_sv = torch.clamp(student(x_val_t), -0.2, 1.5)
+
+            if mode == "student":
+                pred_tv = torch.clamp(teacher(x_val_teacher_t), -0.2, 1.5)
+                loss_val = criterion(pred_student=pred_sv, target=y_val, pred_teacher=pred_tv)
+            else:
+                loss_val = criterion(pred_student=pred_sv, target=y_val)
 
         train_losses.append(loss_train.item())
         val_losses.append(loss_val.item())
         scheduler.step()
 
-        # ---------------- CHECKPOINT ----------------
+        # ---------- CHECKPOINT ----------
         if loss_val < best_val:
             best_val = loss_val
             wait = 0
-
-            # IMPORTANT: save underlying model if DataParallel
-            state_dict = (
-                model.module.state_dict()
-                if isinstance(model, torch.nn.DataParallel)
-                else model.state_dict()
-            )
-
             torch.save(
-                state_dict,
-                os.path.join(save_dir, "best_powernet.pt")
+                student.state_dict(),
+                os.path.join(save_dir, f"best_{mode}_powernet.pt")
             )
         else:
             wait += 1
@@ -178,36 +196,31 @@ def train_powernet(
                 print(f"⏹ Early stopping at epoch {epoch+1}")
                 break
 
-        # ---------------- LOG ----------------
-        if epoch == 0 or (epoch + 1) % 50 == 0:
+        if epoch == 0 or (epoch + 1) % 25 == 0:
             print(
                 f"Epoch {epoch+1:04d} | "
-                f"Train={loss_train.item():.6f} | "
-                f"Val={loss_val.item():.6f}"
+                f"Train={loss_train.item():.5f} | "
+                f"Val={loss_val.item():.5f}"
             )
 
-    print("✅ Training complete!")
+    print("✅ Training complete")
 
     # =====================================================
-    # 8. LOSS PLOT
+    # 10. LOSS PLOT
     # =====================================================
     plt.figure(figsize=(6, 4))
     plt.plot(train_losses, label="Train")
     plt.plot(val_losses, label="Validation")
     plt.xlabel("Epoch")
-    plt.ylabel("Physics-Guided Loss")
-    plt.title(f"PowerNet ({site_name})")
+    plt.ylabel("Loss")
+    plt.title(f"PowerNet ({mode}) – {site_name}")
     plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.grid(alpha=0.4)
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, "training_loss.png"), dpi=300)
+    plt.savefig(os.path.join(save_dir, f"loss_{mode}.png"), dpi=300)
     plt.close()
 
-    print(f"📊 Model & plots saved to {save_dir}")
-
     return {
-        "train_losses": train_losses,
-        "val_losses": val_losses,
         "best_val_loss": best_val,
-        "save_dir": save_dir,
+        "save_dir": save_dir
     }
