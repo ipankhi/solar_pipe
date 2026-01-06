@@ -1,10 +1,9 @@
 # =========================================================
 # PLOTTING UTILITIES for EnhancedPowerNet
-# (Multi-Axis Forecast Plot + Scatter Fit Plot)
+# (Daily Forecast + Scatter Fit)
 # =========================================================
 import os
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 
 
@@ -16,62 +15,57 @@ def _resolve_column(df, candidates):
     raise KeyError(f"None of the columns found: {candidates}")
 
 
-# ---------- 1️⃣ Multi-Axis Forecast Plot (Fixed Date Range) ----------
+# =========================================================
+# 1️⃣ DAILY MULTI-AXIS FORECAST PLOT
+# =========================================================
 def plot_fixed_day_forecast(
-    df_test,
+    df,
     site_name,
-    base_dir,
+    save_dir,
     start_date,
     end_date,
 ):
     """
-    Multi-axis power forecast plot for a fixed date range.
-    Overlays Actual, Predicted, and GHI curves.
+    Multi-axis power forecast plot for a SINGLE day.
+    Overlays Actual, Predicted, and GHI.
     """
 
     plt.rcParams.update({
-        "font.size": 14,
-        "axes.titlesize": 16,
-        "axes.labelsize": 14,
-        "xtick.labelsize": 12,
-        "ytick.labelsize": 12,
-        "legend.fontsize": 12,
-        "figure.titlesize": 16,
+        "font.size": 13,
+        "axes.titlesize": 15,
+        "axes.labelsize": 13,
+        "xtick.labelsize": 11,
+        "ytick.labelsize": 11,
+        "legend.fontsize": 11,
+        "figure.titlesize": 15,
         "axes.linewidth": 1.2,
     })
 
-    # ---------- Resolve column names ----------
-    ts_col = _resolve_column(df_test, ["timestamp", "Timestamp", "time"])
-    actual_col = _resolve_column(df_test, ["Actual_Power_MW", "Actual_Power", "Actual", "actual"])
-    pred_col = _resolve_column(df_test, ["Predicted_Power_MW", "Predicted_Power"])
-    ghi_col = _resolve_column(df_test, ["ghi", "GHI"])
+    # ---------- Resolve columns ----------
+    ts_col = _resolve_column(df, ["Timestamp", "timestamp", "time"])
+    actual_col = _resolve_column(df, ["Actual_Power", "Actual", "actual"])
+    pred_col = _resolve_column(df, ["Predicted_Power"])
+    ghi_col = _resolve_column(df, ["ghi", "GHI"])
 
-    df_test[ts_col] = pd.to_datetime(df_test[ts_col], errors="coerce")
+    df[ts_col] = pd.to_datetime(df[ts_col], errors="coerce")
 
     mask = (
-        (df_test[ts_col].dt.date >= pd.to_datetime(start_date).date()) &
-        (df_test[ts_col].dt.date <= pd.to_datetime(end_date).date())
+        (df[ts_col].dt.date >= pd.to_datetime(start_date).date()) &
+        (df[ts_col].dt.date <= pd.to_datetime(end_date).date())
     )
-    df_plot = df_test.loc[mask]
+    df_plot = df.loc[mask]
 
     if df_plot.empty:
-        print(f"⚠️ No data found for {start_date} → {end_date}")
+        print(f"⚠️ No data found for {start_date}")
         return None
 
-    colors = {
-        "actual": "#0072B2",
-        "predicted": "#000000",
-        "ghi": "#009E73",
-    }
-
-    fig, ax1 = plt.subplots(figsize=(12, 6))
+    fig, ax1 = plt.subplots(figsize=(12, 5.5))
 
     # ---------- Power ----------
     ax1.plot(
         df_plot[ts_col],
         df_plot[actual_col],
         lw=2.2,
-        color=colors["actual"],
         label="Actual Power",
     )
 
@@ -80,12 +74,11 @@ def plot_fixed_day_forecast(
         df_plot[pred_col],
         lw=2.0,
         linestyle="--",
-        color=colors["predicted"],
         label="Predicted Power",
     )
 
     ax1.set_ylabel("Power (MW)")
-    ax1.set_title(f"{site_name}: Actual vs Predicted Power ({start_date} → {end_date})")
+    ax1.set_title(f"{site_name} | {start_date}")
     ax1.grid(alpha=0.3)
 
     # ---------- GHI ----------
@@ -93,49 +86,48 @@ def plot_fixed_day_forecast(
     ax2.plot(
         df_plot[ts_col],
         df_plot[ghi_col],
-        lw=2.2,
-        alpha=0.6,
-        color=colors["ghi"],
+        lw=2.0,
+        alpha=0.5,
         label="GHI (W/m²)",
     )
-    ax2.set_ylabel("GHI (W/m²)", color=colors["ghi"])
-    ax2.tick_params(axis="y", colors=colors["ghi"])
+    ax2.set_ylabel("GHI (W/m²)")
 
     # ---------- Legend ----------
-    l1, lab1 = ax1.get_legend_handles_labels()
-    l2, lab2 = ax2.get_legend_handles_labels()
-    ax1.legend(l1 + l2, lab1 + lab2, loc="upper left", frameon=False)
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper left", frameon=False)
 
     plt.tight_layout()
 
     out_path = os.path.join(
-        base_dir,
-        f"multi_axis_forecast_{site_name}_{start_date}_{end_date}.png"
+        save_dir,
+        f"forecast_{site_name}_{start_date}.png"
     )
     plt.savefig(out_path, dpi=400, bbox_inches="tight")
     plt.close()
 
-    print(f"📈 Multi-axis forecast plot saved → {out_path}")
+    print(f"📈 Saved daily forecast → {out_path}")
     return out_path
 
 
-# ---------- 2️⃣ Scatter Fit Plot ----------
-def plot_scatter_fit(df_test, site_name, base_dir, r2, mae, rmse):
+# =========================================================
+# 2️⃣ SCATTER FIT PLOT (FULL TEST SET)
+# =========================================================
+def plot_scatter_fit(df, site_name, save_dir, r2, mae, rmse):
 
-    actual_col = _resolve_column(df_test, ["Actual_Power_MW", "Actual_Power", "Actual", "actual"])
-    pred_col = _resolve_column(df_test, ["Predicted_Power_MW", "Predicted_Power"])
+    actual_col = _resolve_column(df, ["Actual_Power", "Actual", "actual"])
+    pred_col = _resolve_column(df, ["Predicted_Power"])
 
     plt.figure(figsize=(6, 6))
     plt.scatter(
-        df_test[actual_col],
-        df_test[pred_col],
-        alpha=0.5,
+        df[actual_col],
+        df[pred_col],
+        alpha=0.45,
         edgecolor="k",
         linewidth=0.4,
-        color="#E69F00",
     )
 
-    lims = [0, max(df_test[actual_col].max(), df_test[pred_col].max())]
+    lims = [0, max(df[actual_col].max(), df[pred_col].max())]
     plt.plot(lims, lims, "k--", lw=1)
 
     plt.xlim(lims)
@@ -143,14 +135,14 @@ def plot_scatter_fit(df_test, site_name, base_dir, r2, mae, rmse):
     plt.xlabel("Actual Power (MW)")
     plt.ylabel("Predicted Power (MW)")
     plt.title(
-        f"{site_name} — Model Fit\n"
-        f"R²={r2:.3f}, MAE={mae:.2f}, RMSE={rmse:.2f}"
+        f"{site_name}\n"
+        f"R²={r2:.3f} | MAE={mae:.2f} | RMSE={rmse:.2f}"
     )
     plt.grid(alpha=0.4)
 
-    out_path = os.path.join(base_dir, f"scatter_fit_{site_name}.png")
+    out_path = os.path.join(save_dir, f"scatter_fit_{site_name}.png")
     plt.savefig(out_path, dpi=350, bbox_inches="tight")
     plt.close()
 
-    print(f"📊 Scatter plot saved → {out_path}")
+    print(f"📊 Saved scatter fit → {out_path}")
     return out_path

@@ -40,7 +40,7 @@ FEATURE_COLS = [
     "hour_cos",
 
     # --- Physical baseline ---
-    "climatology_power",
+    # "climatology_power",
 
     # --- Meteorology ---
     # "t2m"
